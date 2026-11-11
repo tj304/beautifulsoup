@@ -9,10 +9,12 @@ from typing import (
     Iterator,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Type,
     Union,
+    TYPE_CHECKING,
 )
 import warnings
 
@@ -24,6 +26,9 @@ from bs4.element import (
     ResultSet,
     Tag,
 )
+if TYPE_CHECKING:
+    from bs4.builder import TreeBuilder
+
 from bs4._typing import (
     _AtMostOneElement,
     _AttributeValue,
@@ -311,33 +316,177 @@ class StringMatchRule(MatchRule):
 
 
 class SoupReplacer:
-    """Replace one tag name with another while the document is parsed.
+    """Transform tags while the document is being parsed.
 
     Pass an instance to :class:`bs4.BeautifulSoup` using the ``replacer``
-    argument. Every parser start-tag and end-tag event whose name equals
-    ``og_tag`` is treated as ``alt_tag`` before the corresponding tree event
-    is processed.
+    argument. A ``SoupReplacer`` can be configured in one of two ways.
 
-    :param og_tag: The tag name to replace.
-    :param alt_tag: The replacement tag name.
+    **Milestone 2 interface -- a replacement pair**::
+
+        SoupReplacer("b", "blockquote")
+
+    Every tag whose name equals ``og_tag`` is renamed to ``alt_tag``.
+
+    **Milestone 3 interface -- transformer functions**::
+
+        SoupReplacer(name_xformer=None, attrs_xformer=None, xformer=None)
+
+    Each transformer is a function that takes the newly created `Tag`
+    as its only argument:
+
+    * ``name_xformer(tag)`` returns the tag's new name (a non-empty str).
+    * ``attrs_xformer(tag)`` returns the tag's new attributes (a mapping).
+    * ``xformer(tag)`` may change the tag in place (side effects); its
+      return value is ignored.
+
+    When several transformers are given they run in that order, so
+    ``attrs_xformer`` and ``xformer`` see the name produced by
+    ``name_xformer``.
+
+    Transformers run when the parser reports the *start* tag, so the tag
+    has its name and attributes but no children yet. A transformer should
+    not detach the tag from the tree or add siblings to it; use a
+    post-parse pass for that.
+
+    The two interfaces cannot be mixed in one instance, because their
+    precedence would be ambiguous. Express a replacement pair as a
+    ``name_xformer`` if you also need other transformers.
+
+    :param og_tag: The tag name to replace (pair interface).
+    :param alt_tag: The replacement tag name (pair interface).
+    :param name_xformer: Function returning a replacement tag name.
+    :param attrs_xformer: Function returning replacement attributes.
+    :param xformer: Function that modifies the tag in place.
     """
 
-    def __init__(self, og_tag: str, alt_tag: str):
-        if not isinstance(og_tag, str) or not isinstance(alt_tag, str):
-            raise TypeError("og_tag and alt_tag must be strings")
-        if not og_tag or not alt_tag:
-            raise ValueError("og_tag and alt_tag must be non-empty strings")
+    og_tag: Optional[str]
+    alt_tag: Optional[str]
+    name_xformer: Optional[Callable[[Tag], str]]
+    attrs_xformer: Optional[Callable[[Tag], Dict[str, Any]]]
+    xformer: Optional[Callable[[Tag], Any]]
+
+    def __init__(
+        self,
+        og_tag: Optional[str] = None,
+        alt_tag: Optional[str] = None,
+        *,
+        name_xformer: Optional[Callable[[Tag], str]] = None,
+        attrs_xformer: Optional[Callable[[Tag], Dict[str, Any]]] = None,
+        xformer: Optional[Callable[[Tag], Any]] = None,
+    ):
+        uses_pair = og_tag is not None or alt_tag is not None
+        uses_xformers = any(
+            f is not None for f in (name_xformer, attrs_xformer, xformer)
+        )
+
+        if uses_pair and uses_xformers:
+            raise ValueError(
+                "Use either SoupReplacer(og_tag, alt_tag) or the "
+                "name_xformer/attrs_xformer/xformer keyword arguments, not both."
+            )
+        if not uses_pair and not uses_xformers:
+            raise ValueError(
+                "SoupReplacer needs og_tag and alt_tag, or at least one of "
+                "name_xformer, attrs_xformer and xformer."
+            )
+
+        if uses_pair:
+            if not isinstance(og_tag, str) or not isinstance(alt_tag, str):
+                raise TypeError("og_tag and alt_tag must be strings")
+            if not og_tag or not alt_tag:
+                raise ValueError("og_tag and alt_tag must be non-empty strings")
+
+        for arg_name, func in (
+            ("name_xformer", name_xformer),
+            ("attrs_xformer", attrs_xformer),
+            ("xformer", xformer),
+        ):
+            if func is not None and not callable(func):
+                raise TypeError(f"{arg_name} must be callable or None")
+
         self.og_tag = og_tag
         self.alt_tag = alt_tag
+        self.name_xformer = name_xformer
+        self.attrs_xformer = attrs_xformer
+        self.xformer = xformer
 
     def replace_tag_name(self, name: str) -> str:
-        """Return the replacement name when *name* matches ``og_tag``."""
-        if name == self.og_tag:
-            return self.alt_tag
+        """Return the replacement name when *name* matches ``og_tag``.
+
+        This is the Milestone 2 pair interface. With the transformer
+        interface it returns *name* unchanged.
+        """
+        if self.og_tag is not None and name == self.og_tag:
+            return cast(str, self.alt_tag)
         return name
 
+    def transform(self, tag: Tag, builder: Optional[TreeBuilder] = None) -> None:
+        """Apply this replacer to a newly created *tag*, in place.
+
+        Called by `BeautifulSoup.handle_starttag` during parsing. It can
+        also be called on any `Tag` outside of parsing.
+
+        :param tag: The tag to transform.
+        :param builder: The `TreeBuilder` that created the tag, used to
+            store returned attributes the way the parser would.
+
+        :raises TypeError: If a transformer returns a value of the wrong
+            type.
+        """
+        new_name = self.replace_tag_name(tag.name)
+
+        if self.name_xformer is not None:
+            new_name = self.name_xformer(tag)
+            if not isinstance(new_name, str) or not new_name:
+                raise TypeError(
+                    "name_xformer must return a non-empty string, "
+                    f"got {new_name!r} for <{tag.name}>"
+                )
+        tag.name = new_name
+
+        if self.attrs_xformer is not None:
+            new_attrs = self.attrs_xformer(tag)
+            if not isinstance(new_attrs, Mapping):
+                raise TypeError(
+                    "attrs_xformer must return a mapping of attribute names "
+                    f"to values, got {type(new_attrs).__name__} for <{tag.name}>"
+                )
+            tag.attrs = self._normalize_attrs(tag, new_attrs, builder)
+
+        if self.xformer is not None:
+            self.xformer(tag)
+
+    @staticmethod
+    def _normalize_attrs(
+        tag: Tag, attrs: Mapping[str, Any], builder: Optional[TreeBuilder]
+    ) -> Any:
+        """Store returned attributes the way the parser would have.
+
+        This uses the builder's attribute dictionary class and turns
+        multi-valued attributes such as ``class`` into lists, so
+        ``attrs_xformer`` can return ``{"class": "a b"}`` and the result
+        behaves like a normally parsed tag.
+        """
+        if builder is None:
+            return dict(attrs)
+        new_attrs = builder.attribute_dict_class()
+        for key, value in attrs.items():
+            new_attrs[key] = value
+        if builder.cdata_list_attributes:
+            new_attrs = builder._replace_cdata_list_attribute_values(
+                tag.name, new_attrs
+            )
+        return new_attrs
+
     def __repr__(self) -> str:
-        return f"<SoupReplacer {self.og_tag!r} -> {self.alt_tag!r}>"
+        if self.og_tag is not None:
+            return f"<SoupReplacer {self.og_tag!r} -> {self.alt_tag!r}>"
+        parts = [
+            name
+            for name in ("name_xformer", "attrs_xformer", "xformer")
+            if getattr(self, name) is not None
+        ]
+        return f"<SoupReplacer {', '.join(parts)}>"
 
 
 class SoupStrainer(ElementFilter):

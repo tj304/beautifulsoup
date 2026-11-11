@@ -258,8 +258,10 @@ class BeautifulSoup(Tag):
          built. This is useful for subclassing Tag or NavigableString
          to modify default behavior.
 
-        :param replacer: Optional SoupReplacer that renames matching tags
-         as parser events are processed, before Tag objects are created.
+        :param replacer: Optional `SoupReplacer` that transforms tags as
+         parser start-tag events are processed, before they are added to
+         the tree. It can rename tags with a replacement pair, or apply
+         ``name_xformer``, ``attrs_xformer`` and ``xformer`` functions.
 
         :param kwargs: For backwards compatibility purposes, the
          constructor accepts certain keyword arguments used in
@@ -440,6 +442,11 @@ class BeautifulSoup(Tag):
                 )
 
         self.builder = builder
+        if replacer is not None and "html5lib" in builder.features:
+            warnings.warn(
+                "The html5lib tree builder doesn't support SoupReplacer, "
+                "so the replacer will be ignored. Use html.parser or lxml."
+            )
         self.is_xml = builder.is_xml
         self.known_xml = self.is_xml
         self._namespaces = dict()
@@ -686,6 +693,7 @@ class BeautifulSoup(Tag):
         self.preserve_whitespace_tag_stack = []
         self.string_container_stack = []
         self._most_recent_element = None
+        self._replacer_source_names: Dict[int, str] = {}
         self.pushTag(self)
 
     def new_tag(
@@ -1024,14 +1032,19 @@ class BeautifulSoup(Tag):
 
         :meta private:
         """
-        # Apply optional tag renaming before any tree-building decisions are
-        # made. End-tag events use the same mapping below so the open-tag
-        # stack remains consistent.
-        if self.replacer is not None:
-            name = self.replacer.replace_tag_name(name)
-
         # print("Start tag %s: %s" % (name, attrs))
         self.endData()
+
+        if self.replacer is not None:
+            return self._handle_starttag_with_replacer(
+                name,
+                namespace,
+                nsprefix,
+                attrs,
+                sourceline=sourceline,
+                sourcepos=sourcepos,
+                namespaces=namespaces,
+            )
 
         if (
             self.parse_only
@@ -1065,6 +1078,66 @@ class BeautifulSoup(Tag):
         self.pushTag(tag)
         return tag
 
+    def _handle_starttag_with_replacer(
+        self,
+        name: str,
+        namespace: Optional[str],
+        nsprefix: Optional[str],
+        attrs: _RawAttributeValues,
+        sourceline: Optional[int] = None,
+        sourcepos: Optional[int] = None,
+        namespaces: Optional[Dict[str, str]] = None,
+    ) -> Optional[Tag]:
+        """handle_starttag() when a `SoupReplacer` is active.
+
+        The tag is created under its source-markup name, so builder
+        decisions that depend on the markup (such as whether it is a void
+        element like <br>) are unchanged. The replacer then transforms it
+        before ``parse_only`` is consulted and before it enters the tree,
+        so the strainer and the rest of the parse see the replaced tag.
+
+        The tag's source name is remembered so that the parser's end-tag
+        event, which still carries the source name, closes this tag even
+        if it was renamed. See `handle_endtag`.
+
+        :meta private:
+        """
+        replacer = cast(SoupReplacer, self.replacer)
+        tag_class = cast(Type[Tag], self.element_classes.get(Tag, Tag))
+        tag = tag_class(
+            self,
+            self.builder,
+            name,
+            namespace,
+            nsprefix,
+            attrs,
+            self.currentTag,
+            self._most_recent_element,
+            sourceline=sourceline,
+            sourcepos=sourcepos,
+            namespaces=namespaces,
+        )
+        if tag is None:
+            return tag
+
+        replacer.transform(tag, self.builder)
+
+        if (
+            self.parse_only
+            and len(self.tagStack) <= 1
+            and not self.parse_only.allow_tag_creation(
+                tag.prefix, tag.name, tag.attrs
+            )
+        ):
+            return None
+
+        self._replacer_source_names[id(tag)] = name
+        if self._most_recent_element is not None:
+            self._most_recent_element.next_element = tag
+        self._most_recent_element = tag
+        self.pushTag(tag)
+        return tag
+
     def handle_endtag(self, name: str, nsprefix: Optional[str] = None) -> None:
         """Called by the tree builder when an ending tag is encountered.
 
@@ -1073,14 +1146,39 @@ class BeautifulSoup(Tag):
 
         :meta private:
         """
-        # Rename the closing tag using the same rule as its opening tag so
-        # parser events continue to match the replacement name in tagStack.
-        if self.replacer is not None:
-            name = self.replacer.replace_tag_name(name)
-
         # print("End tag: " + name)
         self.endData()
-        self._popToTag(name, nsprefix)
+        if self.replacer is not None:
+            self._popToSourceTag(name, nsprefix)
+        else:
+            self._popToTag(name, nsprefix)
+
+    def _popToSourceTag(self, name: str, nsprefix: Optional[str] = None) -> None:
+        """Close the most recent open tag whose *source* name is `name`.
+
+        Used instead of `_popToTag` while a `SoupReplacer` is active. The
+        parser reports end tags by their name in the markup, but the open
+        tag may have been renamed, so matching on ``tag.name`` would fail
+        or close the wrong tag. Tags that were opened after the matching
+        tag and are still open are closed too, as `_popToTag` does.
+
+        :meta private:
+        """
+        if name == self.ROOT_TAG_NAME:
+            return
+        source_names = self._replacer_source_names
+        for i in range(len(self.tagStack) - 1, 0, -1):
+            t = self.tagStack[i]
+            if source_names.get(id(t), t.name) == name and t.prefix == nsprefix:
+                break
+        else:
+            # No open tag came from this end tag's name; ignore it,
+            # as _popToTag does.
+            return
+        while len(self.tagStack) > i:
+            popped = self.tagStack[-1]
+            source_names.pop(id(popped), None)
+            self.popTag()
 
     def handle_data(self, data: str) -> None:
         """Called by the tree builder when a chunk of textual data is
